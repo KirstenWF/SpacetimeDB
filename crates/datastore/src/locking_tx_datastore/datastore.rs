@@ -27,8 +27,8 @@ use crate::{
 };
 use anyhow::{anyhow, Context};
 use core::{cell::RefCell, ops::RangeBounds};
-use parking_lot::{Mutex, RwLock};
-use spacetimedb_commitlog::payload::{txdata, Txdata};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use spacetimedb_commitlog::payload::txdata;
 use spacetimedb_data_structures::map::{HashCollectionExt, HashMap, IntMap};
 use spacetimedb_durability::TxOffset;
 use spacetimedb_lib::{db::auth::StAccess, metrics::ExecutionMetrics};
@@ -141,6 +141,18 @@ impl Locking {
     /// There may eventually be better way to do this, but this will have to do for now.
     pub fn rebuild_state_after_replay(&self) -> Result<()> {
         let mut committed_state = self.committed_state.write_arc();
+
+        // Prior versions of `RelationalDb::migrate_system_tables` (defined in the `core` crate)
+        // initialized newly-created system sequences to `allocation: 4097`,
+        // while `committed_state::bootstrap_system_tables` sets `allocation: 4096`.
+        // This affected the system table migration which added
+        // `st_view_view_id_seq` and `st_view_arg_id_seq`.
+        // As a result, when replaying these databases' commitlogs without a snapshot,
+        // we will end up with two rows in `st_sequence` for each of these sequences,
+        // resulting in a unique constraint violation in `CommittedState::build_indexes`.
+        // We fix this by, for each system sequence, deleting all but the row with the highest allocation.
+        committed_state.fixup_delete_duplicate_system_sequence_rows();
+
         // `build_missing_tables` must be called before indexes.
         // Honestly this should maybe just be one big procedure.
         // See John Carmack's philosophy on this.
@@ -931,6 +943,7 @@ impl MutTx for Locking {
             timer,
             ctx,
             metrics,
+            _not_send: std::marker::PhantomData,
         }
     }
 
@@ -938,6 +951,8 @@ impl MutTx for Locking {
         tx.rollback()
     }
 
+    /// This method only updates the in-memory `committed_state`.
+    /// For durability, see `RelationalDB::commit_tx`.
     fn commit_mut_tx(&self, tx: Self::MutTx) -> Result<Option<(TxOffset, TxData, TxMetrics, String)>> {
         Ok(Some(tx.commit()))
     }
@@ -948,12 +963,10 @@ impl Locking {
         tx.rollback_downgrade(workload)
     }
 
-    pub fn commit_mut_tx_downgrade(
-        &self,
-        tx: MutTxId,
-        workload: Workload,
-    ) -> Result<Option<(TxData, TxMetrics, TxId)>> {
-        Ok(Some(tx.commit_downgrade(workload)))
+    /// This method only updates the in-memory `committed_state`.
+    /// For durability, see `RelationalDB::commit_tx_downgrade`.
+    pub fn commit_mut_tx_downgrade(&self, tx: MutTxId, workload: Workload) -> (TxData, TxMetrics, TxId) {
+        tx.commit_downgrade(workload)
     }
 }
 
@@ -980,7 +993,7 @@ pub struct Replay<F> {
 
 impl<F> Replay<F> {
     fn using_visitor<T>(&self, f: impl FnOnce(&mut ReplayVisitor<'_, F>) -> T) -> T {
-        let mut committed_state = self.committed_state.write_arc();
+        let mut committed_state = self.committed_state.write();
         let mut visitor = ReplayVisitor {
             database_identity: &self.database_identity,
             committed_state: &mut committed_state,
@@ -994,10 +1007,14 @@ impl<F> Replay<F> {
     pub fn next_tx_offset(&self) -> u64 {
         self.committed_state.read_arc().next_tx_offset
     }
+
+    pub fn committed_state(&self) -> RwLockReadGuard<'_, CommittedState> {
+        self.committed_state.read()
+    }
 }
 
-impl<F: FnMut(u64)> spacetimedb_commitlog::Decoder for Replay<F> {
-    type Record = Txdata<ProductValue>;
+impl<F: FnMut(u64)> spacetimedb_commitlog::Decoder for &mut Replay<F> {
+    type Record = txdata::Txdata<ProductValue>;
     type Error = txdata::DecoderError<ReplayError>;
 
     fn decode_record<'a, R: BufReader<'a>>(
@@ -1025,30 +1042,6 @@ impl<F: FnMut(u64)> spacetimedb_commitlog::Decoder for Replay<F> {
         reader: &mut R,
     ) -> std::result::Result<(), Self::Error> {
         self.using_visitor(|visitor| txdata::skip_record_fn(visitor, version, reader))
-    }
-}
-
-impl<F: FnMut(u64)> spacetimedb_commitlog::Decoder for &mut Replay<F> {
-    type Record = txdata::Txdata<ProductValue>;
-    type Error = txdata::DecoderError<ReplayError>;
-
-    #[inline]
-    fn decode_record<'a, R: BufReader<'a>>(
-        &self,
-        version: u8,
-        tx_offset: u64,
-        reader: &mut R,
-    ) -> std::result::Result<Self::Record, Self::Error> {
-        spacetimedb_commitlog::Decoder::decode_record(&**self, version, tx_offset, reader)
-    }
-
-    fn skip_record<'a, R: BufReader<'a>>(
-        &self,
-        version: u8,
-        tx_offset: u64,
-        reader: &mut R,
-    ) -> std::result::Result<(), Self::Error> {
-        spacetimedb_commitlog::Decoder::skip_record(&**self, version, tx_offset, reader)
     }
 }
 
@@ -1272,9 +1265,7 @@ impl<F: FnMut(u64)> spacetimedb_commitlog::payload::txdata::Visitor for ReplayVi
     }
 
     fn visit_tx_end(&mut self) -> std::result::Result<(), Self::Error> {
-        self.committed_state.next_tx_offset += 1;
-
-        Ok(())
+        self.committed_state.replay_end_tx().map_err(Into::into)
     }
 }
 
@@ -3705,6 +3696,20 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_committed_and_rollback_metrics() -> ResultTest<()> {
+        let datastore = get_datastore()?;
+
+        let tx = begin_mut_tx(&datastore);
+        let (_, _, metrics, _) = tx.commit();
+        assert!(metrics.committed);
+
+        let tx = begin_mut_tx(&datastore);
+        let (_, metrics, _) = tx.rollback();
+        assert!(!metrics.committed);
         Ok(())
     }
 }

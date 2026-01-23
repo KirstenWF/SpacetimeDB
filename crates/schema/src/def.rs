@@ -284,6 +284,12 @@ impl ModuleDef {
             .map(|(_, def)| def)
     }
 
+    /// Convenience method to look up a procedure, possibly by a string.
+    pub fn procedure<K: ?Sized + Hash + Equivalent<Identifier>>(&self, name: &K) -> Option<&ProcedureDef> {
+        // If the string IS a valid identifier, we can just look it up.
+        self.procedures.get(name)
+    }
+
     /// Convenience method to look up a procedure, possibly by a string, returning its id as well.
     pub fn procedure_full<K: ?Sized + Hash + Equivalent<Identifier>>(
         &self,
@@ -637,6 +643,7 @@ impl From<IndexDef> for RawIndexDefV9 {
             name: Some(val.name),
             algorithm: match val.algorithm {
                 IndexAlgorithm::BTree(BTreeAlgorithm { columns }) => RawIndexAlgorithm::BTree { columns },
+                IndexAlgorithm::Hash(HashAlgorithm { columns }) => RawIndexAlgorithm::Hash { columns },
                 IndexAlgorithm::Direct(DirectAlgorithm { column }) => RawIndexAlgorithm::Direct { column },
             },
             accessor_name: val.accessor_name.map(Into::into),
@@ -650,8 +657,20 @@ impl From<IndexDef> for RawIndexDefV9 {
 pub enum IndexAlgorithm {
     /// Implemented using a rust `std::collections::BTreeMap`.
     BTree(BTreeAlgorithm),
+    /// Implemented using a rust `std::collections::HashMap`.
+    Hash(HashAlgorithm),
     /// Implemented using `DirectUniqueIndex`.
     Direct(DirectAlgorithm),
+}
+
+impl spacetimedb_memory_usage::MemoryUsage for IndexAlgorithm {
+    fn heap_usage(&self) -> usize {
+        match self {
+            Self::BTree(a) => a.heap_usage(),
+            Self::Direct(a) => a.heap_usage(),
+            Self::Hash(a) => a.heap_usage(),
+        }
+    }
 }
 
 impl IndexAlgorithm {
@@ -659,6 +678,7 @@ impl IndexAlgorithm {
     pub fn columns(&self) -> ColOrCols<'_> {
         match self {
             Self::BTree(btree) => ColOrCols::ColList(&btree.columns),
+            Self::Hash(hash) => ColOrCols::ColList(&hash.columns),
             Self::Direct(direct) => ColOrCols::Col(direct.column),
         }
     }
@@ -674,6 +694,7 @@ impl From<IndexAlgorithm> for RawIndexAlgorithm {
     fn from(val: IndexAlgorithm) -> Self {
         match val {
             IndexAlgorithm::BTree(BTreeAlgorithm { columns }) => Self::BTree { columns },
+            IndexAlgorithm::Hash(HashAlgorithm { columns }) => Self::Hash { columns },
             IndexAlgorithm::Direct(DirectAlgorithm { column }) => Self::Direct { column },
         }
     }
@@ -684,6 +705,12 @@ impl From<IndexAlgorithm> for RawIndexAlgorithm {
 pub struct BTreeAlgorithm {
     /// The columns to index.
     pub columns: ColList,
+}
+
+impl spacetimedb_memory_usage::MemoryUsage for BTreeAlgorithm {
+    fn heap_usage(&self) -> usize {
+        self.columns.heap_usage()
+    }
 }
 
 impl<CL: Into<ColList>> From<CL> for BTreeAlgorithm {
@@ -699,11 +726,43 @@ impl From<BTreeAlgorithm> for IndexAlgorithm {
     }
 }
 
+/// Data specifying a Hash index.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HashAlgorithm {
+    /// The columns to index.
+    pub columns: ColList,
+}
+
+impl spacetimedb_memory_usage::MemoryUsage for HashAlgorithm {
+    fn heap_usage(&self) -> usize {
+        self.columns.heap_usage()
+    }
+}
+
+impl<CL: Into<ColList>> From<CL> for HashAlgorithm {
+    fn from(columns: CL) -> Self {
+        let columns = columns.into();
+        Self { columns }
+    }
+}
+
+impl From<HashAlgorithm> for IndexAlgorithm {
+    fn from(val: HashAlgorithm) -> Self {
+        IndexAlgorithm::Hash(val)
+    }
+}
+
 /// Data specifying a Direct index.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DirectAlgorithm {
     /// The column to index.
     pub column: ColId,
+}
+
+impl spacetimedb_memory_usage::MemoryUsage for DirectAlgorithm {
+    fn heap_usage(&self) -> usize {
+        self.column.heap_usage()
+    }
 }
 
 impl<C: Into<ColId>> From<C> for DirectAlgorithm {
@@ -859,6 +918,14 @@ pub enum ConstraintData {
     Unique(UniqueConstraintData),
 }
 
+impl spacetimedb_memory_usage::MemoryUsage for ConstraintData {
+    fn heap_usage(&self) -> usize {
+        match self {
+            ConstraintData::Unique(d) => d.heap_usage(),
+        }
+    }
+}
+
 impl ConstraintData {
     /// If this is a unique constraint, returns the columns that must be unique.
     /// Otherwise, returns `None`.
@@ -884,6 +951,12 @@ impl From<ConstraintData> for RawConstraintDataV9 {
 pub struct UniqueConstraintData {
     /// The columns on the containing `TableDef`
     pub columns: ColSet,
+}
+
+impl spacetimedb_memory_usage::MemoryUsage for UniqueConstraintData {
+    fn heap_usage(&self) -> usize {
+        self.columns.heap_usage()
+    }
 }
 
 impl From<UniqueConstraintData> for RawUniqueConstraintDataV9 {

@@ -460,7 +460,7 @@ fn copy_filter_fixed_len(c: &mut Criterion) {
             group.bench_function(keep_ratio.to_string(), |b| {
                 b.iter_with_large_drop(|| unsafe {
                     let mut keep_iter = keep_seq.iter().copied();
-                    black_box(&pages).copy_filter(visitor, row_size, &mut NullBlobStore, |_, _| {
+                    black_box(&pages).copy_filter(visitor, row_size, None::<&mut Box<dyn FnMut(_)>>, |_, _| {
                         black_box(keep_iter.next().unwrap_or_default())
                     })
                 });
@@ -917,7 +917,7 @@ fn index_seek(c: &mut Criterion) {
                     let mut elapsed = WallTime.zero();
                     for _ in 0..num_iters {
                         let (row, none) = time(&mut elapsed, || {
-                            let mut iter = index.seek_range(&col_to_seek);
+                            let mut iter = index.seek_range(&col_to_seek).unwrap();
                             (iter.next(), iter.next())
                         });
                         assert!(

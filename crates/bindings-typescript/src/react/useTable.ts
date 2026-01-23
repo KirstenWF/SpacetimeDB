@@ -10,6 +10,7 @@ import { type EventContextInterface } from '../sdk/db_connection_impl';
 import type { ConnectionState } from './connection_state';
 import type { UntypedRemoteModule } from '../sdk/spacetime_module';
 import type { RowType, UntypedTableDef } from '../lib/table';
+import { Uuid } from '../lib/uuid';
 import type { Prettify } from '../lib/type_util';
 
 export interface UseTableCallbacks<RowType> {
@@ -18,7 +19,7 @@ export interface UseTableCallbacks<RowType> {
   onUpdate?: (oldRow: RowType, newRow: RowType) => void;
 }
 
-export type Value = string | number | boolean;
+export type Value = string | number | boolean | Uuid;
 
 export type Expr<Column extends string> =
   | { type: 'eq'; key: Column; value: Value }
@@ -76,6 +77,7 @@ export function evaluate<Column extends string>(
 ): boolean {
   switch (expr.type) {
     case 'eq': {
+      // The actual value of the Column
       const v = row[expr.key];
       if (
         typeof v === 'string' ||
@@ -83,6 +85,16 @@ export function evaluate<Column extends string>(
         typeof v === 'boolean'
       ) {
         return v === expr.value;
+      }
+      if (typeof v === 'object') {
+        // Value of the Column and passed Value are both a Uuid so do an integer comparison.
+        if (v instanceof Uuid && expr.value instanceof Uuid) {
+          return v.asBigInt() === expr.value.asBigInt();
+        }
+        // Value of the Column is a Uuid but passed Value is a String so compare them via string.
+        if (v instanceof Uuid && typeof expr.value === 'string') {
+          return v.toString() === expr.value;
+        }
       }
       return false;
     }
@@ -105,6 +117,13 @@ function formatValue(v: Value): string {
       return Number.isFinite(v) ? String(v) : `'${String(v)}'`;
     case 'boolean':
       return v ? 'TRUE' : 'FALSE';
+    case 'object': {
+      if (v instanceof Uuid) {
+        return `'${v.toString()}'`;
+      }
+
+      return '';
+    }
   }
 }
 
@@ -268,6 +287,7 @@ export function useTable<TableDef extends UntypedTableDef>(
 ): [readonly Prettify<RowType<TableDef>>[], boolean] {
   type UseTableRowType = RowType<TableDef>;
   const tableName = tableDef.name;
+  const accessorName = tableDef.accessorName;
   let whereClause: Expr<ColumnsFromRow<UseTableRowType>> | undefined;
   if (
     whereClauseOrCallbacks &&
@@ -313,7 +333,7 @@ export function useTable<TableDef extends UntypedTableDef>(
     if (!connection) {
       return [[], false];
     }
-    const table = connection.db[tableName];
+    const table = connection.db[accessorName];
     const result: readonly Prettify<UseTableRowType>[] = whereClause
       ? (Array.from(table.iter()).filter(row =>
           evaluate(whereClause, row as UseTableRowType)
@@ -321,7 +341,7 @@ export function useTable<TableDef extends UntypedTableDef>(
       : (Array.from(table.iter()) as Prettify<UseTableRowType>[]);
     return [result, subscribeApplied];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionState, tableName, whereKey, subscribeApplied]);
+  }, [connectionState, accessorName, whereKey, subscribeApplied]);
 
   useEffect(() => {
     const connection = connectionState.getConnection()!;
@@ -412,7 +432,7 @@ export function useTable<TableDef extends UntypedTableDef>(
         return () => {};
       }
 
-      const table = connection.db[tableName];
+      const table = connection.db[accessorName];
       table.onInsert(onInsert);
       table.onDelete(onDelete);
       table.onUpdate?.(onUpdate);
@@ -426,7 +446,7 @@ export function useTable<TableDef extends UntypedTableDef>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       connectionState,
-      tableName,
+      accessorName,
       whereKey,
       callbacks?.onDelete,
       callbacks?.onInsert,

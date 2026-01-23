@@ -45,7 +45,9 @@ async function main() {
     repoRoot,
     'docs',
     'docs',
-    '00500-cli-reference',
+    '00300-resources',
+    '00200-reference',
+    '00100-cli-reference',
     '00100-cli-reference.md',
   );
 

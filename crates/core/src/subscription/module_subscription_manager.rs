@@ -9,7 +9,8 @@ use crate::error::DBError;
 use crate::host::module_host::{DatabaseTableUpdate, ModuleEvent, UpdatesRelValue};
 use crate::messages::websocket::{self as ws, TableUpdate};
 use crate::subscription::delta::eval_delta;
-use crate::subscription::websocket_building::BuildableWebsocketFormat;
+use crate::subscription::row_list_builder_pool::{BsatnRowListBuilderPool, JsonRowListBuilderFakePool};
+use crate::subscription::websocket_building::{BuildableWebsocketFormat, RowListBuilderSource};
 use crate::worker_metrics::WORKER_METRICS;
 use core::mem;
 use parking_lot::RwLock;
@@ -1141,14 +1142,48 @@ impl SubscriptionManager {
     pub fn eval_updates_sequential(
         &self,
         (tx, tx_offset): (&DeltaTx, TransactionOffset),
+        bsatn_rlb_pool: &BsatnRowListBuilderPool,
         event: Arc<ModuleEvent>,
         caller: Option<Arc<ClientConnectionSender>>,
     ) -> ExecutionMetrics {
-        use FormatSwitch::{Bsatn, Json};
-
-        let tables = &event.status.database_update().unwrap().tables;
-
         let span = tracing::info_span!("eval_incr").entered();
+
+        let (updates, errs, metrics) = if self.queries.is_empty() {
+            // We have no queries, so do nothing.
+            <_>::default()
+        } else {
+            let tables = &event.status.database_update().unwrap().tables;
+            self.eval_updates_sequential_inner(tx, bsatn_rlb_pool, tables)
+        };
+
+        let queries = ComputedQueries {
+            updates,
+            errs,
+            event,
+            caller,
+        };
+
+        // We've now finished all of the work which needs to read from the datastore,
+        // so get this work off the main thread and over to the `send_worker`,
+        // then return ASAP in order to unlock the datastore and start running the next transaction.
+        // See comment on the `send_worker_tx` field in [`SubscriptionManager`] for more motivation.
+        self.send_worker_queue
+            .send(SendWorkerMessage::Broadcast { tx_offset, queries })
+            .expect("send worker has panicked, or otherwise dropped its recv queue!");
+
+        drop(span);
+
+        metrics
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn eval_updates_sequential_inner(
+        &self,
+        tx: &DeltaTx,
+        bsatn_rlb_pool: &BsatnRowListBuilderPool,
+        tables: &[DatabaseTableUpdate],
+    ) -> (Vec<ClientUpdate>, Vec<(ClientId, Box<str>)>, ExecutionMetrics) {
+        use FormatSwitch::{Bsatn, Json};
 
         #[derive(Default)]
         struct FoldState {
@@ -1230,12 +1265,13 @@ impl SubscriptionManager {
                     updates: &UpdatesRelValue<'_>,
                     memory: &mut Option<(F::QueryUpdate, u64, usize)>,
                     metrics: &mut ExecutionMetrics,
+                    rlb_pool: &impl RowListBuilderSource<F>,
                 ) -> SingleQueryUpdate<F> {
                     let (update, num_rows, num_bytes) = memory
                         .get_or_insert_with(|| {
                             // TODO(centril): consider pushing the encoding of each row into
                             // `eval_delta` instead, to avoid building the temporary `Vec`s in `UpdatesRelValue`.
-                            let encoded = updates.encode::<F>();
+                            let encoded = updates.encode::<F>(rlb_pool);
                             // The first time we insert into this map, we call encode.
                             // This is when we serialize the rows to BSATN/JSON.
                             // Hence this is where we increment `bytes_scanned`.
@@ -1280,11 +1316,13 @@ impl SubscriptionManager {
                                     &delta_updates,
                                     &mut ops_bin_uncompressed,
                                     &mut acc.metrics,
+                                    bsatn_rlb_pool,
                                 )),
                                 Protocol::Text => Json(memo_encode::<JsonFormat>(
                                     &delta_updates,
                                     &mut ops_json,
                                     &mut acc.metrics,
+                                    &JsonRowListBuilderFakePool,
                                 )),
                             };
                             ClientUpdate {
@@ -1301,25 +1339,7 @@ impl SubscriptionManager {
                 acc
             });
 
-        // We've now finished all of the work which needs to read from the datastore,
-        // so get this work off the main thread and over to the `send_worker`,
-        // then return ASAP in order to unlock the datastore and start running the next transaction.
-        // See comment on the `send_worker_tx` field in [`SubscriptionManager`] for more motivation.
-        self.send_worker_queue
-            .send(SendWorkerMessage::Broadcast {
-                tx_offset,
-                queries: ComputedQueries {
-                    updates,
-                    errs,
-                    event,
-                    caller,
-                },
-            })
-            .expect("send worker has panicked, or otherwise dropped its recv queue!");
-
-        drop(span);
-
-        metrics
+        (updates, errs, metrics)
     }
 }
 
@@ -1655,6 +1675,7 @@ mod tests {
     use crate::host::module_host::DatabaseTableUpdate;
     use crate::sql::ast::SchemaViewer;
     use crate::subscription::module_subscription_manager::ClientQueryId;
+    use crate::subscription::row_list_builder_pool::BsatnRowListBuilderPool;
     use crate::subscription::tx::DeltaTx;
     use crate::{
         client::{ClientActorId, ClientConfig, ClientConnectionSender, ClientName},
@@ -2524,7 +2545,13 @@ mod tests {
                 db.report_read_tx_metrics(reducer, tx_metrics);
             });
             let delta_tx = DeltaTx::from(&*tx);
-            subscriptions.eval_updates_sequential((&delta_tx, offset_rx), event, Some(Arc::new(client0)));
+            let bsatn_rlb_pool = BsatnRowListBuilderPool::new();
+            subscriptions.eval_updates_sequential(
+                (&delta_tx, offset_rx),
+                &bsatn_rlb_pool,
+                event,
+                Some(Arc::new(client0)),
+            );
         }
 
         runtime.block_on(async move {
