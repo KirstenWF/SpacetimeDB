@@ -248,7 +248,6 @@ void UDbConnectionBase::ProcessServerMessage(const FServerMessageType& Message)
 		const FIdentityTokenType Payload = Message.GetAsIdentityToken();
 
 		Token = Payload.Token;
-		UCredentials::SaveToken(Token);
 		Identity = Payload.Identity;
 		bIsIdentitySet = true;
 		UE_LOG(LogSpacetimeDb_Connection, Verbose, TEXT("IdentityToken: Identity set to: %s"), *Identity.ToHex());
@@ -261,7 +260,7 @@ void UDbConnectionBase::ProcessServerMessage(const FServerMessageType& Message)
 	}
 	case EServerMessageTag::OneOffQueryResponse:
 	{
-		//@Note: Not implemented in Rust version, skip for now here aswell
+		//@Note: Not implemented in Rust version, skip for now here as well
 		break;
 	}
 	case EServerMessageTag::SubscribeApplied:

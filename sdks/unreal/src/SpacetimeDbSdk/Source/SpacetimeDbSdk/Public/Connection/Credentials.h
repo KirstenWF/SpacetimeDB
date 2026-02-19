@@ -33,10 +33,18 @@ public:
     UFUNCTION(BlueprintCallable, Category = "SpacetimeDB|Credentials")
     static void SaveToken(const FString& InToken);
 
-    /** Currently loaded authentication token */
-    static FString Token;
+	/** Load a previously stored token based on StoredKey, not requiring Init() call. */
+	UFUNCTION(BlueprintCallable, Category = "SpacetimeDB|Credentials")
+	static FString LoadTokenWithKey(const FString& InStoredKey);
+
+	/** Persist a token with StoredKey for later retrieval, not requiring Init() call. */
+	UFUNCTION(BlueprintCallable, Category = "SpacetimeDB|Credentials")
+	static void SaveTokenWithKey(const FString& InStoredKey, const FString& InToken);
 
 private:
+	/** Currently loaded authentication token */
+	static FString Token;
+
     /** Key used when storing the token via the config system */
     static FString StoredKey;
 };
