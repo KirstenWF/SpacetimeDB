@@ -3,13 +3,14 @@ use crate::db::MetricsRecorderQueue;
 use crate::error::{DBError, RestoreSnapshotError};
 use crate::messages::control_db::HostType;
 use crate::subscription::ExecutionCounters;
-use crate::util::{asyncify, spawn_rayon};
+use crate::util::asyncify;
 use crate::worker_metrics::WORKER_METRICS;
 use anyhow::{anyhow, Context};
 use enum_map::EnumMap;
 use log::info;
 use spacetimedb_commitlog::repo::OnNewSegmentFn;
 use spacetimedb_commitlog::{self as commitlog, Commitlog, SizeOnDisk};
+use spacetimedb_data_structures::map::HashSet;
 use spacetimedb_datastore::db_metrics::DB_METRICS;
 use spacetimedb_datastore::error::{DatastoreError, TableError, ViewError};
 use spacetimedb_datastore::execution_context::{Workload, WorkloadType};
@@ -44,11 +45,14 @@ use spacetimedb_paths::server::{ReplicaDir, SnapshotsPath};
 use spacetimedb_primitives::*;
 use spacetimedb_sats::algebraic_type::fmt::fmt_algebraic_type;
 use spacetimedb_sats::memory_usage::MemoryUsage;
+use spacetimedb_sats::raw_identifier::RawIdentifier;
 use spacetimedb_sats::{AlgebraicType, AlgebraicValue, ProductType, ProductValue};
 use spacetimedb_schema::def::{ModuleDef, TableDef, ViewDef};
+use spacetimedb_schema::reducer_name::ReducerName;
 use spacetimedb_schema::schema::{
     ColumnSchema, IndexSchema, RowLevelSecuritySchema, Schema, SequenceSchema, TableSchema,
 };
+use spacetimedb_schema::table_name::TableName;
 use spacetimedb_snapshot::{ReconstructedSnapshot, SnapshotError, SnapshotRepository};
 use spacetimedb_table::indexes::RowPointer;
 use spacetimedb_table::page_pool::PagePool;
@@ -56,7 +60,6 @@ use spacetimedb_table::table::{RowRef, TableScanIter};
 use spacetimedb_vm::errors::{ErrorType, ErrorVm};
 use spacetimedb_vm::ops::parse;
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
@@ -153,7 +156,7 @@ impl RelationalDB {
         let (durability, disk_size_fn, snapshot_worker, rt) = Persistence::unzip(persistence);
         let durability = durability
             .zip(rt)
-            .map(|(durability, rt)| DurabilityWorker::new(durability, rt));
+            .map(|(durability, rt)| DurabilityWorker::new(database_identity, durability, rt));
 
         Self {
             inner,
@@ -359,6 +362,16 @@ impl RelationalDB {
         None
     }
 
+    /// Create any system tables that are missing from the datastore.
+    ///
+    /// This runs during database startup, *after* `restore_from_snapshot` and `apply_history`
+    /// have reconstructed the committed state from persisted data. Older snapshots may predate
+    /// the introduction of newer system tables (e.g. `st_event_table`, `st_view`), so those
+    /// tables won't exist in the restored state. This method fills them in.
+    ///
+    /// Because of this ordering, code that runs during snapshot restoration
+    /// (such as `schema_for_table_raw`) must tolerate missing system tables gracefully
+    /// — they will be created here shortly after.
     fn migrate_system_tables(&self) -> Result<(), DBError> {
         let mut tx = self.begin_mut_tx(IsolationLevel::Serializable, Workload::Internal);
         for schema in system_tables() {
@@ -769,7 +782,7 @@ impl RelationalDB {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn rollback_mut_tx(&self, tx: MutTx) -> (TxOffset, TxMetrics, String) {
+    pub fn rollback_mut_tx(&self, tx: MutTx) -> (TxOffset, TxMetrics, Option<ReducerName>) {
         log::trace!("ROLLBACK MUT TX");
         self.inner.rollback_mut_tx(tx)
     }
@@ -781,14 +794,17 @@ impl RelationalDB {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn release_tx(&self, tx: Tx) -> (TxOffset, TxMetrics, String) {
+    pub fn release_tx(&self, tx: Tx) -> (TxOffset, TxMetrics, Option<ReducerName>) {
         log::trace!("RELEASE TX");
         self.inner.release_tx(tx)
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     #[allow(clippy::type_complexity)]
-    pub fn commit_tx(&self, tx: MutTx) -> Result<Option<(TxOffset, Arc<TxData>, TxMetrics, String)>, DBError> {
+    pub fn commit_tx(
+        &self,
+        tx: MutTx,
+    ) -> Result<Option<(TxOffset, Arc<TxData>, TxMetrics, Option<ReducerName>)>, DBError> {
         log::trace!("COMMIT MUT TX");
 
         let reducer_context = tx.ctx.reducer_context().cloned();
@@ -848,12 +864,11 @@ impl RelationalDB {
     /// This requires a small amount of additional logic when restoring from a snapshot
     /// to ensure we don't restore a snapshot more recent than the durable TX offset.
     fn maybe_do_snapshot(&self, tx_data: &TxData) {
-        if let Some(snapshot_worker) = &self.snapshot_worker {
-            if let Some(tx_offset) = tx_data.tx_offset() {
-                if tx_offset % SNAPSHOT_FREQUENCY == 0 {
-                    snapshot_worker.request_snapshot();
-                }
-            }
+        if let Some(snapshot_worker) = &self.snapshot_worker
+            && let Some(tx_offset) = tx_data.tx_offset()
+            && tx_offset % SNAPSHOT_FREQUENCY == 0
+        {
+            snapshot_worker.request_snapshot();
         }
     }
 
@@ -1002,7 +1017,7 @@ impl RelationalDB {
     /// Should only be called after the tx lock has been fully released.
     pub(crate) fn report_tx_metrics(
         &self,
-        reducer: String,
+        reducer: Option<ReducerName>,
         tx_data: Option<Arc<TxData>>,
         metrics_for_writer: Option<TxMetrics>,
         metrics_for_reader: Option<TxMetrics>,
@@ -1110,7 +1125,7 @@ impl RelationalDB {
     pub fn create_table_for_test_with_the_works(
         &self,
         name: &str,
-        schema: &[(&str, AlgebraicType)],
+        schema: &[(&'static str, AlgebraicType)],
         indexes: &[ColList],
         unique_constraints: &[ColList],
         access: StAccess,
@@ -1118,7 +1133,11 @@ impl RelationalDB {
         let mut module_def_builder = RawModuleDefV9Builder::new();
 
         let mut table_builder = module_def_builder
-            .build_table_with_new_type_for_tests(name, ProductType::from_iter(schema.iter().cloned()), true)
+            .build_table_with_new_type_for_tests(
+                RawIdentifier::new(name),
+                ProductType::from_iter(schema.iter().cloned()),
+                true,
+            )
             .with_access(access.into());
 
         for columns in indexes {
@@ -1142,7 +1161,7 @@ impl RelationalDB {
     pub fn create_table_for_test_with_access(
         &self,
         name: &str,
-        schema: &[(&str, AlgebraicType)],
+        schema: &[(&'static str, AlgebraicType)],
         indexes: &[ColId],
         access: StAccess,
     ) -> Result<TableId, DBError> {
@@ -1153,7 +1172,7 @@ impl RelationalDB {
     pub fn create_table_for_test(
         &self,
         name: &str,
-        schema: &[(&str, AlgebraicType)],
+        schema: &[(&'static str, AlgebraicType)],
         indexes: &[ColId],
     ) -> Result<TableId, DBError> {
         self.create_table_for_test_with_access(name, schema, indexes, StAccess::Public)
@@ -1162,7 +1181,7 @@ impl RelationalDB {
     pub fn create_table_for_test_multi_column(
         &self,
         name: &str,
-        schema: &[(&str, AlgebraicType)],
+        schema: &[(&'static str, AlgebraicType)],
         idx_cols: ColList,
     ) -> Result<TableId, DBError> {
         self.create_table_for_test_with_the_works(name, schema, &[idx_cols], &[], StAccess::Public)
@@ -1171,7 +1190,7 @@ impl RelationalDB {
     pub fn create_table_for_test_mix_indexes(
         &self,
         name: &str,
-        schema: &[(&str, AlgebraicType)],
+        schema: &[(&'static str, AlgebraicType)],
         idx_cols_single: &[ColId],
         idx_cols_multi: ColList,
     ) -> Result<TableId, DBError> {
@@ -1190,7 +1209,7 @@ impl RelationalDB {
     /// relatively cheap operation which only modifies the system tables.
     ///
     /// If the table is not found or is a system table, an error is returned.
-    pub fn rename_table(&self, tx: &mut MutTx, table_id: TableId, new_name: &str) -> Result<(), DBError> {
+    pub fn rename_table(&self, tx: &mut MutTx, table_id: TableId, new_name: TableName) -> Result<(), DBError> {
         Ok(self.inner.rename_table_mut_tx(tx, table_id, new_name)?)
     }
 
@@ -1384,7 +1403,7 @@ impl RelationalDB {
             TableId,
             Bound<AlgebraicValue>,
             Bound<AlgebraicValue>,
-            impl Iterator<Item = RowRef<'a>>,
+            impl Iterator<Item = RowRef<'a>> + use<'a>,
         ),
         DBError,
     > {
@@ -1396,7 +1415,7 @@ impl RelationalDB {
         tx: &'a MutTx,
         index_id: IndexId,
         point: &[u8],
-    ) -> Result<(TableId, AlgebraicValue, impl Iterator<Item = RowRef<'a>>), DBError> {
+    ) -> Result<(TableId, AlgebraicValue, impl Iterator<Item = RowRef<'a>> + use<'a>), DBError> {
         Ok(tx.index_scan_point(index_id, point)?)
     }
 
@@ -1469,12 +1488,17 @@ impl RelationalDB {
     }
 
     /// Reports the metrics for `reducer`, using counters provided by `db`.
-    pub fn report_mut_tx_metrics(&self, reducer: String, metrics: TxMetrics, tx_data: Option<Arc<TxData>>) {
+    pub fn report_mut_tx_metrics(
+        &self,
+        reducer: Option<ReducerName>,
+        metrics: TxMetrics,
+        tx_data: Option<Arc<TxData>>,
+    ) {
         self.report_tx_metrics(reducer, tx_data, Some(metrics), None);
     }
 
     /// Reports subscription metrics for `reducer`, using counters provided by `db`.
-    pub fn report_read_tx_metrics(&self, reducer: String, metrics: TxMetrics) {
+    pub fn report_read_tx_metrics(&self, reducer: Option<ReducerName>, metrics: TxMetrics) {
         self.report_tx_metrics(reducer, None, None, Some(metrics));
     }
 
@@ -1716,7 +1740,6 @@ pub async fn local_durability(
     snapshot_worker: Option<&SnapshotWorker>,
 ) -> Result<(LocalDurability, DiskSizeFn), DBError> {
     let rt = tokio::runtime::Handle::current();
-    // TODO: Should this better be spawn_blocking?
     let on_new_segment = snapshot_worker.map(|snapshot_worker| {
         let snapshot_worker = snapshot_worker.clone();
         Arc::new(move || {
@@ -1725,17 +1748,11 @@ pub async fn local_durability(
             snapshot_worker.request_snapshot_ignore_closed();
         }) as Arc<OnNewSegmentFn>
     });
-    let local = spawn_rayon(move || {
+    let local = asyncify(move || {
         durability::Local::open(
             replica_dir.clone(),
             rt,
-            durability::local::Options {
-                commitlog: commitlog::Options {
-                    max_records_in_commit: 1.try_into().unwrap(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            <_>::default(),
             // Give the durability a handle to request a new snapshot run,
             // which it will send down whenever we rotate commitlog segments.
             on_new_segment,
@@ -1754,7 +1771,7 @@ pub async fn local_durability(
 /// Open a [History] for replay from the local durable state.
 ///
 /// Currently, this is simply a read-only copy of the commitlog.
-pub async fn local_history(replica_dir: &ReplicaDir) -> io::Result<impl History<TxData = Txdata>> {
+pub async fn local_history(replica_dir: &ReplicaDir) -> io::Result<impl History<TxData = Txdata> + use<>> {
     let commitlog_dir = replica_dir.commit_log();
     asyncify(move || Commitlog::open(commitlog_dir, <_>::default(), None)).await
 }
@@ -1774,10 +1791,10 @@ pub async fn snapshot_watching_commitlog_compressor(
         let snapshot_offset = *snapshot_rx.borrow_and_update();
         let durability = durability.clone();
 
-        if let Some(snap_tx) = &mut snap_tx {
-            if let Err(err) = snap_tx.try_send(snapshot_offset) {
-                tracing::warn!("failed to send offset {snapshot_offset} after snapshot creation: {err}");
-            }
+        if let Some(snap_tx) = &mut snap_tx
+            && let Err(err) = snap_tx.try_send(snapshot_offset)
+        {
+            tracing::warn!("failed to send offset {snapshot_offset} after snapshot creation: {err}");
         }
 
         let res: io::Result<_> = asyncify(move || {
@@ -1810,10 +1827,10 @@ pub async fn snapshot_watching_commitlog_compressor(
         };
         prev_snapshot_offset = snapshot_offset;
 
-        if let Some((clog_tx, last_compressed_segment)) = clog_tx.as_mut().zip(last_compressed_segment) {
-            if let Err(err) = clog_tx.try_send(last_compressed_segment) {
-                tracing::warn!("failed to send offset {last_compressed_segment} after compression: {err}");
-            }
+        if let Some((clog_tx, last_compressed_segment)) = clog_tx.as_mut().zip(last_compressed_segment)
+            && let Err(err) = clog_tx.try_send(last_compressed_segment)
+        {
+            tracing::warn!("failed to send offset {last_compressed_segment} after compression: {err}");
         }
     }
 }
@@ -2214,21 +2231,22 @@ pub mod tests_utils {
     pub fn create_view_for_test(
         db: &RelationalDB,
         name: &str,
-        schema: &[(&str, AlgebraicType)],
+        schema: &[(&'static str, AlgebraicType)],
         is_anonymous: bool,
     ) -> Result<(ViewId, TableId), DBError> {
         let mut builder = RawModuleDefV9Builder::new();
 
         // Add the view's product type to the typespace
+        let name = RawIdentifier::new(name);
         let type_ref = builder.add_algebraic_type(
             [],
-            name,
+            name.clone(),
             AlgebraicType::Product(ProductType::from_iter(schema.iter().cloned())),
             true,
         );
 
         builder.add_view(
-            name,
+            name.clone(),
             0,
             true,
             is_anonymous,
@@ -2237,7 +2255,7 @@ pub mod tests_utils {
         );
 
         let module_def: ModuleDef = builder.finish().try_into()?;
-        let view_def: &ViewDef = module_def.view(name).expect("view not found");
+        let view_def: &ViewDef = module_def.view(&*name).expect("view not found");
 
         // Allocate a backing table and return its table id
         db.with_auto_commit(Workload::Internal, |tx| db.create_view(tx, &module_def, view_def))
@@ -2378,7 +2396,7 @@ mod tests {
         f: impl FnOnce(RawTableDefBuilder<'_>) -> RawTableDefBuilder,
     ) -> TableSchema {
         let mut builder = RawModuleDefV9Builder::new();
-        f(builder.build_table_with_new_type(name, columns, true));
+        f(builder.build_table_with_new_type(RawIdentifier::new(name), columns, true));
         let raw = builder.finish();
         let def: ModuleDef = raw.try_into().expect("table validation failed");
         let table = def.table(name).expect("table not found");
@@ -3159,7 +3177,7 @@ mod tests {
         let mut tx = begin_mut_tx(&stdb);
 
         let table_id = stdb.create_table(&mut tx, table_indexed(true))?;
-        stdb.rename_table(&mut tx, table_id, "YourTable")?;
+        stdb.rename_table(&mut tx, table_id, TableName::for_test("YourTable"))?;
         let table_name = stdb.table_name_from_id_mut(&tx, table_id)?;
 
         assert_eq!(Some("YourTable"), table_name.as_ref().map(Cow::as_ref));
@@ -3277,7 +3295,7 @@ mod tests {
         let timestamp = Timestamp::now();
         let workload = |name: &str| {
             Workload::Reducer(ReducerContext {
-                name: name.into(),
+                name: ReducerName::for_test(name),
                 caller_identity: Identity::__dummy(),
                 caller_connection_id: ConnectionId::ZERO,
                 timestamp,
@@ -3468,9 +3486,9 @@ mod tests {
                 arg_bsatn,
             } = ReducerContext::try_from(&input).unwrap();
             if i == 0 {
-                assert_eq!(reducer_name, "__identity_connected__");
+                assert_eq!(&*reducer_name, "__identity_connected__");
             } else {
-                assert_eq!(reducer_name, "abstract_concrete_proxy_factory_impl");
+                assert_eq!(&*reducer_name, "abstract_concrete_proxy_factory_impl");
             }
             assert!(
                 arg_bsatn.is_empty(),
