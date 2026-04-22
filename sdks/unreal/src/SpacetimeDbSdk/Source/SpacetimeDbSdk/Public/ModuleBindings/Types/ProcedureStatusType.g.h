@@ -24,7 +24,7 @@ public:
 
     TVariant<FString, TArray<uint8>> MessageData;
 
-    UPROPERTY(BlueprintReadOnly)
+    UPROPERTY(BlueprintReadOnly, Category = "SpacetimeDB|ProcedureStatus")
     EProcedureStatusTag Tag = static_cast<EProcedureStatusTag>(0);
 
     static FProcedureStatusType Returned(const TArray<uint8>& Value)

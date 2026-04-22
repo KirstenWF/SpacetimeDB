@@ -28,7 +28,7 @@ public:
 
     TVariant<FReducerOkType, FString, TArray<uint8>, FSpacetimeDBUnit> MessageData;
 
-    UPROPERTY(BlueprintReadOnly)
+    UPROPERTY(BlueprintReadOnly, Category = "SpacetimeDB|ReducerOutcome")
     EReducerOutcomeTag Tag = static_cast<EReducerOutcomeTag>(0);
 
     static FReducerOutcomeType Ok(const FReducerOkType& Value)

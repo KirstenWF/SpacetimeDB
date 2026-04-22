@@ -24,7 +24,7 @@ public:
 
     TVariant<uint16, TArray<uint64>> MessageData;
 
-    UPROPERTY(BlueprintReadOnly)
+    UPROPERTY(BlueprintReadOnly, Category = "SpacetimeDB|RowSizeHint")
     ERowSizeHintTag Tag = static_cast<ERowSizeHintTag>(0);
 
     static FRowSizeHintType FixedSize(const uint16& Value)

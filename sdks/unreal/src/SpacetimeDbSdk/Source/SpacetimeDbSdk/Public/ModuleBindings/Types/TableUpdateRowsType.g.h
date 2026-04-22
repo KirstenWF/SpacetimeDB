@@ -26,7 +26,7 @@ public:
 
     TVariant<FEventTableRowsType, FPersistentTableRowsType> MessageData;
 
-    UPROPERTY(BlueprintReadOnly)
+    UPROPERTY(BlueprintReadOnly, Category = "SpacetimeDB|TableUpdateRows")
     ETableUpdateRowsTag Tag = static_cast<ETableUpdateRowsTag>(0);
 
     static FTableUpdateRowsType PersistentTable(const FPersistentTableRowsType& Value)
