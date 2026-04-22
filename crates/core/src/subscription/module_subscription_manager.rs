@@ -10,6 +10,7 @@ use crate::host::module_host::{DatabaseTableUpdate, ModuleEvent, UpdatesRelValue
 use crate::subscription::delta::eval_delta;
 use crate::subscription::row_list_builder_pool::{BsatnRowListBuilderPool, JsonRowListBuilderFakePool};
 use crate::subscription::websocket_building::{BuildableWebsocketFormat, RowListBuilderSource};
+use crate::util::adaptive_recv::AdaptiveUnboundedReceiver;
 use crate::worker_metrics::WORKER_METRICS;
 type V2EvalUpdatesResult = (Vec<V2ClientUpdate>, Vec<(SubscriptionIdV2, Box<str>)>, ExecutionMetrics);
 use core::mem;
@@ -37,6 +38,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// Clients are uniquely identified by their Identity and ConnectionId.
@@ -1221,6 +1223,12 @@ impl SubscriptionManager {
 
         debug_assert!(client_info.legacy_subscriptions.is_empty());
         let mut queries_to_remove = Vec::new();
+        let v1_query_hashes = client_info
+            .v1_subscriptions
+            .values()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
         for (subscription_id, queries) in client_info.v2_subscriptions {
             for query_hash in queries {
                 let Some(query_state) = self.queries.get_mut(&query_hash) else {
@@ -1241,15 +1249,15 @@ impl SubscriptionManager {
             }
         }
         // This loop can be removed once v1 subscriptions are removed.
-        for query_hash in client_info.subscription_ref_count.keys() {
-            let Some(query_state) = self.queries.get_mut(query_hash) else {
+        for query_hash in v1_query_hashes {
+            let Some(query_state) = self.queries.get_mut(&query_hash) else {
                 // This can happen if they are cliented up in the v2 loop above.
                 continue;
             };
             query_state.subscriptions.remove(client);
             // This could happen twice for the same hash if a client has a duplicate, but that's fine. It is idepotent.
             if !query_state.has_subscribers() {
-                queries_to_remove.push(*query_hash);
+                queries_to_remove.push(query_hash);
                 SubscriptionManager::remove_query_from_tables(
                     &mut self.tables,
                     &mut self.join_edges,
@@ -1472,8 +1480,6 @@ impl SubscriptionManager {
             })
             .fold(FoldState::default(), |mut acc, (qstate, plan, _hash)| {
                 let table_name = plan.subscribed_table_name().clone();
-                // let subscriptions_for_query = qstate.v2_subscriptions
-
                 match eval_delta(tx, &mut acc.metrics, plan) {
                     Err(err) => {
                         tracing::error!(
@@ -1711,7 +1717,7 @@ impl SendWorkerClient {
 /// See comment on the `send_worker_tx` field in [`SubscriptionManager`] for motivation.
 struct SendWorker {
     /// Receiver end of the [`SubscriptionManager`]'s `send_worker_tx` channel.
-    rx: mpsc::UnboundedReceiver<SendWorkerMessage>,
+    rx: AdaptiveUnboundedReceiver<SendWorkerMessage>,
 
     /// `subscription_send_queue_length` metric labeled for this database's `Identity`.
     ///
@@ -1752,6 +1758,12 @@ impl Drop for SendWorker {
 }
 
 impl SendWorker {
+    // Keep the worker warm briefly after handling a message so bursts do not
+    // pay a park/unpark cost on every enqueue, while still parking quickly
+    // once traffic goes quiet.
+    const BASELINE_LINGER: Duration = Duration::from_micros(25);
+    const MAX_LINGER: Duration = Duration::from_micros(200);
+
     fn is_client_dropped_or_cancelled(&self, client_id: &ClientId) -> bool {
         self.clients
             .get(client_id)
@@ -1810,7 +1822,7 @@ impl SendWorker {
         database_identity_to_clean_up_metric: Option<Identity>,
     ) -> Self {
         Self {
-            rx,
+            rx: AdaptiveUnboundedReceiver::new(rx, Self::BASELINE_LINGER, Self::MAX_LINGER),
             queue_length_metric,
             clients: Default::default(),
             database_identity_to_clean_up_metric,
@@ -2213,8 +2225,11 @@ mod tests {
     }
 
     fn compile_plan(db: &RelationalDB, sql: &str) -> ResultTest<Arc<Plan>> {
+        compile_plan_with_auth(db, sql, AuthCtx::for_testing())
+    }
+
+    fn compile_plan_with_auth(db: &RelationalDB, sql: &str, auth: AuthCtx) -> ResultTest<Arc<Plan>> {
         with_read_only(db, |tx| {
-            let auth = AuthCtx::for_testing();
             let tx = SchemaViewer::new(&*tx, &auth);
             let (plans, has_param) = SubscriptionPlan::compile(sql, &tx, &auth).unwrap();
             let hash = QueryHash::from_string(sql, auth.caller(), has_param);
@@ -2228,6 +2243,14 @@ mod tests {
 
     fn client(connection_id: u128, db: &Arc<RelationalDB>) -> ClientConnectionSender {
         let (identity, connection_id) = id(connection_id);
+        client_with_identity(identity, connection_id, db)
+    }
+
+    fn client_with_identity(
+        identity: Identity,
+        connection_id: ConnectionId,
+        db: &Arc<RelationalDB>,
+    ) -> ClientConnectionSender {
         ClientConnectionSender::dummy(
             ClientActorId {
                 identity,

@@ -294,6 +294,12 @@ namespace SpacetimeDB.Internal.TableHandles
 
         public static SpacetimeDB.Internal.RawScheduleDefV10? MakeScheduleDesc() => null;
 
+        /// <summary>
+        /// Returns the number of rows in this table.
+        ///
+        /// This reads datastore metadata, so it runs in constant time.
+        /// It also takes into account modifications by the current transaction.
+        /// </summary>
         public ulong Count =>
             global::SpacetimeDB.Internal.ITableView<DemoTable, global::DemoTable>.DoCount();
 
@@ -305,6 +311,9 @@ namespace SpacetimeDB.Internal.TableHandles
 
         public bool Delete(global::DemoTable row) =>
             global::SpacetimeDB.Internal.ITableView<DemoTable, global::DemoTable>.DoDelete(row);
+
+        public ulong Clear() =>
+            global::SpacetimeDB.Internal.ITableView<DemoTable, global::DemoTable>.DoClear();
 
         public sealed class IdUniqueIndex
             : UniqueIndex<DemoTable, global::DemoTable, int, SpacetimeDB.BSATN.I32>
@@ -361,18 +370,27 @@ sealed class demo_viewViewDispatcher : global::SpacetimeDB.Internal.IView
     public byte[] Invoke(
         System.IO.BinaryReader reader,
         global::SpacetimeDB.Internal.IViewContext ctx
+    ) => __spacetimedb_begin_short_backtrace(reader, ctx);
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining
+    )]
+    private static byte[] __spacetimedb_begin_short_backtrace(
+        System.IO.BinaryReader reader,
+        global::SpacetimeDB.Internal.IViewContext ctx
     )
     {
         try
         {
             var returnValue = Reducers.DemoView((SpacetimeDB.ViewContext)ctx);
-            SpacetimeDB.BSATN.List<DemoTable, DemoTable.BSATN> returnRW = new();
+            var listSerializer = new SpacetimeDB.BSATN.List<DemoTable, DemoTable.BSATN>();
+            var listValue = global::System.Linq.Enumerable.ToList(returnValue);
             var header = new global::SpacetimeDB.Internal.ViewResultHeader.RowData(default);
             var headerRW = new global::SpacetimeDB.Internal.ViewResultHeader.BSATN();
             using var output = new System.IO.MemoryStream();
             using var writer = new System.IO.BinaryWriter(output);
             headerRW.Write(writer, header);
-            returnRW.Write(writer, returnValue);
+            listSerializer.Write(writer, listValue);
             return output.ToArray();
         }
         catch (System.Exception e)
@@ -391,6 +409,12 @@ namespace SpacetimeDB.Internal.ViewHandles
         internal DemoTableReadOnly()
             : base("DemoTable") { }
 
+        /// <summary>
+        /// Returns the number of rows in this table.
+        ///
+        /// This reads datastore metadata, so it runs in constant time.
+        /// It also takes into account modifications by the current transaction.
+        /// </summary>
         public ulong Count => DoCount();
 
         public sealed class IdIndex
@@ -461,7 +485,16 @@ static class ModuleRegistration
 
         public SpacetimeDB.Internal.Lifecycle? Lifecycle => null;
 
-        public void Invoke(BinaryReader reader, SpacetimeDB.Internal.IReducerContext ctx)
+        public void Invoke(BinaryReader reader, SpacetimeDB.Internal.IReducerContext ctx) =>
+            __spacetimedb_begin_short_backtrace(reader, ctx);
+
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.NoInlining
+        )]
+        private static void __spacetimedb_begin_short_backtrace(
+            BinaryReader reader,
+            SpacetimeDB.Internal.IReducerContext ctx
+        )
         {
             Reducers.DemoReducer((SpacetimeDB.ReducerContext)ctx, valueRW.Read(reader));
         }
@@ -479,7 +512,16 @@ static class ModuleRegistration
                 Visibility: SpacetimeDB.Internal.FunctionVisibility.ClientCallable
             );
 
-        public byte[] Invoke(BinaryReader reader, SpacetimeDB.Internal.IProcedureContext ctx)
+        public byte[] Invoke(BinaryReader reader, SpacetimeDB.Internal.IProcedureContext ctx) =>
+            __spacetimedb_begin_short_backtrace(reader, ctx);
+
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.NoInlining
+        )]
+        private static byte[] __spacetimedb_begin_short_backtrace(
+            BinaryReader reader,
+            SpacetimeDB.Internal.IProcedureContext ctx
+        )
         {
             Reducers.DemoProcedure((SpacetimeDB.ProcedureContext)ctx);
             return System.Array.Empty<byte>();

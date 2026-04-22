@@ -239,7 +239,12 @@ export type ReadonlyTable<TableDef extends UntypedTableDef> = Prettify<
 >;
 
 export interface ReadonlyTableMethods<TableDef extends UntypedTableDef> {
-  /** Returns the number of rows in the TX state. */
+  /**
+   * Returns the number of rows in this table.
+   *
+   * This reads datastore metadata, so it runs in constant time.
+   * It also takes into account modifications by the current transaction.
+   */
   count(): bigint;
 
   /** Iterate over all rows in the TX state. Rust Iterator<Item=Row> → TS IterableIterator<Row>. */
@@ -263,6 +268,13 @@ export interface TableMethods<TableDef extends UntypedTableDef>
 
   /** Delete a row equal to `row`. Returns true if something was deleted. */
   delete(row: Prettify<RowType<TableDef>>): boolean;
+
+  /**
+   * Clears the table of all rows.
+   * Returns the number of rows deleted,
+   * i.e., the return value of `this.count()` before this call.
+   */
+  clear(): bigint;
 }
 
 /**
@@ -399,7 +411,8 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
       });
     }
 
-    if (meta.defaultValue) {
+    // Check for defaultValue on the property to allow for 0, false, '', and undefined as defaults
+    if (Object.prototype.hasOwnProperty.call(meta, 'defaultValue')) {
       const writer = new BinaryWriter(16);
       builder.serialize(writer, meta.defaultValue);
       defaultValues.push({

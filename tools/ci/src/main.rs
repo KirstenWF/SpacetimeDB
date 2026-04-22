@@ -218,7 +218,8 @@ enum CiCmd {
     Test,
     /// Lints the codebase
     ///
-    /// Runs rustfmt, clippy, csharpier and generates rust docs to ensure there are no warnings.
+    /// Runs rustfmt, clippy, csharpier, TypeScript lint, and generates rust docs to ensure there
+    /// are no warnings.
     Lint,
     /// Tests Wasm bindings
     ///
@@ -306,6 +307,8 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Some(CiCmd::Test) => {
+            cmd!("pnpm", "build").dir("crates/bindings-typescript").run()?;
+
             // TODO: This doesn't work on at least user Linux machines, because something here apparently uses `sudo`?
 
             // Exclude smoketests from `cargo test --all` since they require pre-built binaries.
@@ -332,6 +335,20 @@ fn main() -> Result<()> {
                 "spacetimedb-sdk",
                 "--features",
                 "allow_loopback_http_for_tests",
+                "--",
+                "--test-threads=2",
+                "--skip",
+                "unreal"
+            )
+            .run()?;
+            // Run the same SDK suite against wasm/browser test clients.
+            cmd!(
+                "cargo",
+                "test",
+                "-p",
+                "spacetimedb-sdk",
+                "--features",
+                "allow_loopback_http_for_tests,browser",
                 "--",
                 "--test-threads=2",
                 "--skip",
@@ -395,10 +412,24 @@ fn main() -> Result<()> {
                 "warnings",
             )
             .run()?;
+            cmd!(
+                "cargo",
+                "clippy",
+                "--no-default-features",
+                "--features=browser",
+                "-pspacetimedb-sdk",
+                "--tests",
+                "--benches",
+                "--",
+                "-D",
+                "warnings",
+            )
+            .run()?;
             cmd!("dotnet", "tool", "restore").dir("crates/bindings-csharp").run()?;
             cmd!("dotnet", "csharpier", "--check", ".")
                 .dir("crates/bindings-csharp")
                 .run()?;
+            cmd!("pnpm", "lint").run()?;
             // `bindings` is the only crate we care strongly about documenting,
             // since we link to its docs.rs from our website.
             // We won't pass `--no-deps`, though,
@@ -508,6 +539,7 @@ fn main() -> Result<()> {
         }
 
         Some(CiCmd::Smoketests(args)) => {
+            ensure_repo_root()?;
             smoketest::run(args)?;
         }
 
