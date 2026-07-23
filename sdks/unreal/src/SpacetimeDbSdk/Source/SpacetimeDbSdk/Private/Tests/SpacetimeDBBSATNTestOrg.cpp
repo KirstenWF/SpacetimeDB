@@ -39,6 +39,10 @@
 #include "ModuleBindings/Optionals/SpacetimeDbSdkOptionalQueryRows.g.h"
 
 
+// WAYFINDER_CHANGE: kirsten@wayfindergames.se - BEGIN: Shipping build fixes
+#if WITH_DEV_AUTOMATION_TESTS
+// WAYFINDER_CHANGE: kirsten@wayfindergames.se - END
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Simple Automation Test entry-point
 // ──────────────────────────────────────────────────────────────────────────────
@@ -360,3 +364,5 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 	return true;
 }
+
+#endif // WITH_DEV_AUTOMATION_TESTS
