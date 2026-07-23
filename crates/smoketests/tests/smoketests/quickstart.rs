@@ -111,11 +111,24 @@ fn create_nuget_config(sources: &[(String, PathBuf)], mappings: &[(String, Strin
         source_lines.push_str(&format!("    <add key=\"{}\" value=\"{}\" />\n", key, path.display()));
     }
 
+    // Group patterns by source while preserving source order (first seen first)
+    let mut patterns_by_source: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut source_order: Vec<String> = Vec::new();
     for (key, pattern) in mappings {
-        mapping_lines.push_str(&format!(
-            "    <packageSource key=\"{}\">\n      <package pattern=\"{}\" />\n    </packageSource>\n",
-            key, pattern
-        ));
+        if !patterns_by_source.contains_key(key) {
+            source_order.push(key.clone());
+        }
+        patterns_by_source.entry(key.clone()).or_default().push(pattern.clone());
+    }
+
+    // Write mappings in insertion order (ensures nuget.org with * comes last)
+    for key in source_order {
+        let patterns = patterns_by_source.get(&key).unwrap();
+        mapping_lines.push_str(&format!("    <packageSource key=\"{}\">\n", key));
+        for pattern in patterns {
+            mapping_lines.push_str(&format!("      <package pattern=\"{}\" />\n", pattern));
+        }
+        mapping_lines.push_str("    </packageSource>\n");
     }
 
     format!(
@@ -133,14 +146,32 @@ fn create_nuget_config(sources: &[(String, PathBuf)], mappings: &[(String, Strin
 
 /// Override nuget config to use a local NuGet package on a .NET project.
 fn override_nuget_package(project_dir: &Path, package: &str, source_dir: &Path, build_subdir: &str) -> Result<()> {
+    override_nuget_package_from_project(project_dir, package, source_dir, None, build_subdir)
+}
+
+/// Override nuget config to use a local NuGet package built from a specific .NET project.
+fn override_nuget_package_from_project(
+    project_dir: &Path,
+    package: &str,
+    source_dir: &Path,
+    source_project: Option<&str>,
+    build_subdir: &str,
+) -> Result<()> {
     println!("Override {package}: {project_dir:?} with {source_dir:?}");
 
     // Make sure the local package is built
     let workspace = workspace_root();
     let repo_nuget_config = workspace.join("NuGet.Config");
+    let source_project_path = source_project.map(|project| source_dir.join(project));
     if repo_nuget_config.exists() {
-        let output = Command::new("dotnet")
-            .args(["restore", "--configfile", repo_nuget_config.to_str().unwrap()])
+        let mut command = Command::new("dotnet");
+        command.arg("restore");
+        if let Some(source_project_path) = &source_project_path {
+            command.arg(source_project_path);
+        }
+        let output = command
+            .arg("--configfile")
+            .arg(&repo_nuget_config)
             .current_dir(source_dir)
             .output()
             .context("Failed to run dotnet restore")?;
@@ -152,8 +183,13 @@ fn override_nuget_package(project_dir: &Path, package: &str, source_dir: &Path, 
             );
         }
 
-        let output = Command::new("dotnet")
-            .args(["pack", "-c", "Release", "--no-restore"])
+        let mut command = Command::new("dotnet");
+        command.arg("pack");
+        if let Some(source_project_path) = &source_project_path {
+            command.arg(source_project_path);
+        }
+        let output = command
+            .args(["-c", "Release", "--no-restore"])
             .current_dir(source_dir)
             .output()
             .context("Failed to run dotnet pack")?;
@@ -165,8 +201,13 @@ fn override_nuget_package(project_dir: &Path, package: &str, source_dir: &Path, 
             );
         }
     } else {
-        let output = Command::new("dotnet")
-            .args(["pack", "-c", "Release"])
+        let mut command = Command::new("dotnet");
+        command.arg("pack");
+        if let Some(source_project_path) = &source_project_path {
+            command.arg(source_project_path);
+        }
+        let output = command
+            .args(["-c", "Release"])
             .current_dir(source_dir)
             .output()
             .context("Failed to run dotnet pack")?;
@@ -201,6 +242,44 @@ fn override_nuget_package(project_dir: &Path, package: &str, source_dir: &Path, 
         mappings.push((package.to_string(), package.to_string()));
     }
 
+    // Ensure dotnet-experimental feed exists (needed for NativeAOT-LLVM ILCompiler packages)
+    if !sources.iter().any(|(k, _)| k == "dotnet-experimental") {
+        sources.push((
+            "dotnet-experimental".to_string(),
+            PathBuf::from(
+                "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-experimental/nuget/v3/index.json",
+            ),
+        ));
+    }
+    if !mappings.iter().any(|(k, _)| k == "dotnet-experimental") {
+        mappings.push((
+            "dotnet-experimental".to_string(),
+            "Microsoft.DotNet.ILCompiler.LLVM".to_string(),
+        ));
+        mappings.push(("dotnet-experimental".to_string(), "runtime.*".to_string()));
+    }
+
+    // Add package source mappings for SpacetimeDB packages to local sources
+    // This must come BEFORE the nuget.org wildcard mapping to ensure local packages are used
+    let local_runtime_source = sources
+        .iter()
+        .find(|(k, _)| k.contains("runtime") || k.contains("Runtime"))
+        .map(|(k, _)| k.clone());
+    if let Some(source_key) = local_runtime_source {
+        if !mappings
+            .iter()
+            .any(|(k, p)| k == &source_key && p == "SpacetimeDB.Runtime")
+        {
+            mappings.push((source_key.clone(), "SpacetimeDB.Runtime".to_string()));
+        }
+        if !mappings
+            .iter()
+            .any(|(k, p)| k == &source_key && p == "SpacetimeDB.BSATN.Runtime")
+        {
+            mappings.push((source_key, "SpacetimeDB.BSATN.Runtime".to_string()));
+        }
+    }
+
     // Ensure nuget.org fallback exists
     if !sources.iter().any(|(k, _)| k == "nuget.org") {
         sources.push((
@@ -214,6 +293,7 @@ fn override_nuget_package(project_dir: &Path, package: &str, source_dir: &Path, 
 
     // Write config
     let config = create_nuget_config(&sources, &mappings);
+    eprintln!("Generated nuget.config at {:?}:\n{}", nuget_config_path, config);
     fs::write(&nuget_config_path, config)?;
 
     let _ = Command::new("dotnet")
@@ -237,9 +317,16 @@ fn parse_nuget_config(content: &str) -> (Vec<(String, PathBuf)>, Vec<(String, St
         sources.push((cap[1].to_string(), PathBuf::from(&cap[2])));
     }
 
-    let mapping_re = regex::Regex::new(r#"<packageSource key="([^"]+)">\s*<package pattern="([^"]+)""#).unwrap();
-    for cap in mapping_re.captures_iter(content) {
-        mappings.push((cap[1].to_string(), cap[2].to_string()));
+    // Parse packageSourceMapping sections - need to find all patterns for each source
+    let section_re = regex::Regex::new(r#"<packageSource key="([^"]+)">(.*?)<\/packageSource>"#).unwrap();
+    let pattern_re = regex::Regex::new(r#"<package pattern="([^"]+)""#).unwrap();
+
+    for cap in section_re.captures_iter(content) {
+        let source_key = cap[1].to_string();
+        let section_content = &cap[2];
+        for pattern_cap in pattern_re.captures_iter(section_content) {
+            mappings.push((source_key.clone(), pattern_cap[1].to_string()));
+        }
     }
 
     (sources, mappings)
@@ -453,7 +540,9 @@ impl QuickstartTest {
         eprintln!("Generating server code {}: {:?}...", self.config.lang, server_path);
 
         // Initialize the project (local operation, doesn't need server)
-        let output = self.test.spacetime(&[
+        // For C#, force .NET 10 so Roslyn 5 analyzers can load.
+        let is_csharp = self.config.lang == "csharp";
+        let mut init_args = vec![
             "init",
             "--non-interactive",
             "--lang",
@@ -461,7 +550,11 @@ impl QuickstartTest {
             "--project-path",
             server_path.to_str().unwrap(),
             "spacetimedb-project",
-        ])?;
+        ];
+        if is_csharp {
+            init_args.extend_from_slice(&["--dotnet-version", "10"]);
+        }
+        let output = self.test.spacetime(&init_args)?;
         eprintln!("spacetime init output: {}", output);
 
         let project_path = server_path.join("spacetimedb");
@@ -637,10 +730,11 @@ log = "0.4"
                     &workspace.join("crates/bindings-csharp/BSATN.Runtime"),
                     "bin/Release",
                 )?;
-                override_nuget_package(
+                override_nuget_package_from_project(
                     client_path,
                     "SpacetimeDB.ClientSDK",
                     &workspace.join("sdks/csharp"),
+                    Some("SpacetimeDB.ClientSDK.csproj"),
                     "bin~/Release",
                 )?;
 
@@ -737,7 +831,11 @@ log = "0.4"
 
         // Replace server address
         let host = self.test.server_host();
-        let protocol = "http"; // The smoketest server uses http
+        let protocol = if self.test.server_url.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
         main_code = main_code.replace("http://localhost:3000", &format!("{}://{}", protocol, host));
 
         // Write the client code
