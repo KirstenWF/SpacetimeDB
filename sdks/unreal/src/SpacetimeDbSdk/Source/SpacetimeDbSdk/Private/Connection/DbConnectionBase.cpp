@@ -225,7 +225,10 @@ void UDbConnectionBase::HandleWSBinaryMessage(const TArray<uint8>& Message)
 
 		//parse the message, decompress if needed
 		FServerMessageType Parsed;
-		if (!This->PreProcessMessage(Message, Parsed))
+		// WAYFINDER_CHANGE -BEGIN: rows stay with this message until it is released in order
+		FPreprocessedTableDataList TableData;
+		if (!This->PreProcessMessage(Message, Parsed, TableData))
+		// WAYFINDER_CHANGE -END
 		{
 			AsyncTask(ENamedThreads::GameThread, [WeakThis]()
 			{
@@ -245,18 +248,32 @@ void UDbConnectionBase::HandleWSBinaryMessage(const TArray<uint8>& Message)
 			FScopeLock Lock(&This->PreprocessMutex);
 			// Move the parsed message into the map to avoid copying
 			This->PreprocessedMessages.Add(Id, MoveTemp(Parsed));
+			// WAYFINDER_CHANGE -BEGIN: queue each message's rows in release order, which is the order the game thread takes them
+			This->PreprocessedTableDataById.Add(Id, MoveTemp(TableData));
 			//check if we can release any messages in order
 			while (This->PreprocessedMessages.Contains(This->NextReleaseId))
 			{
 				Ready.Add(This->PreprocessedMessages.FindAndRemoveChecked(This->NextReleaseId));
+				FPreprocessedTableDataList ReleasedTableData = This->PreprocessedTableDataById.FindAndRemoveChecked(This->NextReleaseId);
+				if (ReleasedTableData.Num() > 0)
+				{
+					FScopeLock DataLock(&This->PreprocessedDataMutex);
+					for (TPair<FPreprocessedTableKey, TSharedPtr<UE::SpacetimeDB::FPreprocessedTableDataBase>>& Entry : ReleasedTableData)
+					{
+						This->PreprocessedTableData.FindOrAdd(Entry.Key).Add(MoveTemp(Entry.Value));
+					}
+				}
 				++This->NextReleaseId;
 			}
-		}
-		//if we have any ready messages, append them to the pending messages list that is processed in Tick
-		if (Ready.Num() > 0)
-		{
-			FScopeLock Lock(&This->PendingMessagesMutex);
-			This->PendingMessages.Append(MoveTemp(Ready));
+
+			// Append while still holding PreprocessMutex: appended after unlocking, another worker's later batch could land
+			// first, and the game thread would then take an earlier message's rows. FrameTick only takes PendingMessagesMutex.
+			if (Ready.Num() > 0)
+			{
+				FScopeLock PendingLock(&This->PendingMessagesMutex);
+				This->PendingMessages.Append(MoveTemp(Ready));
+			}
+			// WAYFINDER_CHANGE -END
 		}
 	});
 }
@@ -559,7 +576,9 @@ void UDbConnectionBase::ClearPendingOperations(const FString& Reason)
 	}
 }
 
-void UDbConnectionBase::PreProcessDatabaseUpdate(const FDatabaseUpdateType& Update)
+// WAYFINDER_CHANGE -BEGIN: rows go to OutTableData instead of straight into the shared per-table queue
+void UDbConnectionBase::PreProcessDatabaseUpdate(const FDatabaseUpdateType& Update, FPreprocessedTableDataList& OutTableData)
+// WAYFINDER_CHANGE -END
 {
 	for (const FTableUpdateType& TableUpdate : Update.Tables)
 	{
@@ -583,10 +602,9 @@ void UDbConnectionBase::PreProcessDatabaseUpdate(const FDatabaseUpdateType& Upda
 			TSharedPtr<UE::SpacetimeDB::FPreprocessedTableDataBase> Data = Deserializer->PreProcess(TableUpdate.Rows, TableUpdate.TableName);
 			if (Data.IsValid())
 			{
-				FScopeLock Lock(&PreprocessedDataMutex);
-				FPreprocessedTableKey Key(TableUpdate.TableName);
-				TArray<TSharedPtr<UE::SpacetimeDB::FPreprocessedTableDataBase>>& Queue = PreprocessedTableData.FindOrAdd(Key);
-				Queue.Add(Data);
+				// WAYFINDER_CHANGE -BEGIN: queued into PreprocessedTableData when the message is released in order
+				OutTableData.Emplace(FPreprocessedTableKey(TableUpdate.TableName), Data);
+				// WAYFINDER_CHANGE -END
 			}
 		}
 		else
@@ -596,7 +614,9 @@ void UDbConnectionBase::PreProcessDatabaseUpdate(const FDatabaseUpdateType& Upda
 	}
 }
 
-bool UDbConnectionBase::PreProcessMessage(const TArray<uint8>& Message, FServerMessageType& OutMessage)
+// WAYFINDER_CHANGE -BEGIN: OutTableData receives the message's deserialized rows
+bool UDbConnectionBase::PreProcessMessage(const TArray<uint8>& Message, FServerMessageType& OutMessage, FPreprocessedTableDataList& OutTableData)
+// WAYFINDER_CHANGE -END
 {
 	if (Message.Num() == 0)
 	{
@@ -620,12 +640,13 @@ bool UDbConnectionBase::PreProcessMessage(const TArray<uint8>& Message, FServerM
 	OutMessage = UE::SpacetimeDB::Deserialize<FServerMessageType>(Decompressed);
 
 	// Preprocess row-bearing payloads for table deserializers.
+	// WAYFINDER_CHANGE -BEGIN: pass OutTableData through
 	switch (OutMessage.Tag)
 	{
 		case EServerMessageTag::SubscribeApplied:
 		{
 			const FSubscribeAppliedType Payload = OutMessage.GetAsSubscribeApplied();
-			PreProcessDatabaseUpdate(QueryRowsToDatabaseUpdate(Payload.Rows, false));
+			PreProcessDatabaseUpdate(QueryRowsToDatabaseUpdate(Payload.Rows, false), OutTableData);
 			break;
 		}
 		case EServerMessageTag::UnsubscribeApplied:
@@ -633,14 +654,14 @@ bool UDbConnectionBase::PreProcessMessage(const TArray<uint8>& Message, FServerM
 			const FUnsubscribeAppliedType Payload = OutMessage.GetAsUnsubscribeApplied();
 			if (Payload.Rows.IsSet())
 			{
-				PreProcessDatabaseUpdate(QueryRowsToDatabaseUpdate(Payload.Rows.Value, true));
+				PreProcessDatabaseUpdate(QueryRowsToDatabaseUpdate(Payload.Rows.Value, true), OutTableData);
 			}
 			break;
 		}
 		case EServerMessageTag::TransactionUpdate:
 		{
 			const FTransactionUpdateType Payload = OutMessage.GetAsTransactionUpdate();
-			PreProcessDatabaseUpdate(TransactionUpdateToDatabaseUpdate(Payload));
+			PreProcessDatabaseUpdate(TransactionUpdateToDatabaseUpdate(Payload), OutTableData);
 			break;
 		}
 		case EServerMessageTag::ReducerResult:
@@ -648,13 +669,14 @@ bool UDbConnectionBase::PreProcessMessage(const TArray<uint8>& Message, FServerM
 			const FReducerResultType Payload = OutMessage.GetAsReducerResult();
 			if (Payload.Result.IsOk())
 			{
-				PreProcessDatabaseUpdate(TransactionUpdateToDatabaseUpdate(Payload.Result.GetAsOk().TransactionUpdate));
+				PreProcessDatabaseUpdate(TransactionUpdateToDatabaseUpdate(Payload.Result.GetAsOk().TransactionUpdate), OutTableData);
 			}
 			break;
 		}
 		default:
 			break;
 	}
+	// WAYFINDER_CHANGE -END
 	return true;
 }
 
@@ -776,12 +798,20 @@ void UDbConnectionBase::ApplyRegisteredTableUpdates(const FDatabaseUpdateType& U
 		}
 		if (Handler.IsValid())
 		{
-			// Update the cache for the handler with the table update and context
+			// WAYFINDER_CHANGE -BEGIN: one table can get one TableUpdate per query, collect them and apply and broadcast once per table
 			Handler->UpdateCache(this, TableUpdate, Context);
-			Handlers.Add(Handler);
+			Handlers.AddUnique(Handler);
+			// WAYFINDER_CHANGE -END
 		}
 	}
-	
+
+	// WAYFINDER_CHANGE -BEGIN: apply every table before broadcasting, as before, so listeners see the whole message in the cache
+	for (TSharedPtr<ITableUpdateHandler>& Handler : Handlers)
+	{
+		Handler->ApplyPendingToCache();
+	}
+	// WAYFINDER_CHANGE -END
+
 	for (TSharedPtr<ITableUpdateHandler>& Handler : Handlers)
 	{
 		// Broadcast the diff for each handler

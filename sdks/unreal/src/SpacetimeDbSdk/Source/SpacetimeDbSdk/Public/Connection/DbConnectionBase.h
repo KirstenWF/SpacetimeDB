@@ -184,8 +184,13 @@ public:
 	public:
 		virtual ~ITableUpdateHandler() {}
 
-		/** Update the in-memory cache for the table and store the diff */
+		// WAYFINDER_CHANGE -BEGIN: a message carries one TableUpdate per query, so one table can get several; collect them and apply once, otherwise LastDiff keeps only the last query's diff and broadcasts it once per query
+		/** Collect this TableUpdate's rows; the cache is updated by ApplyPendingToCache */
 		virtual void UpdateCache(UDbConnectionBase* Conn, const FTableUpdateType& Update, void* Context) = 0;
+
+		/** Apply all rows collected since the last call to the in-memory cache and store the diff */
+		virtual void ApplyPendingToCache() = 0;
+		// WAYFINDER_CHANGE -END
 
 		/** Broadcast the previously stored diff */
 		virtual void BroadcastDiff(UDbConnectionBase* Conn, void* Context) = 0;
@@ -197,7 +202,8 @@ public:
 	public:
 		explicit TTableUpdateHandler(TableClass* InTable) : Table(InTable) {}
 
-		//** Update the in-memory cache for the table and store the diff */
+		// WAYFINDER_CHANGE -BEGIN: collect per TableUpdate, apply once per message (see ITableUpdateHandler)
+		//** Collect this TableUpdate's rows for ApplyPendingToCache */
 		virtual void UpdateCache(UDbConnectionBase* Conn, const FTableUpdateType& Update, void* Context) override
 		{
 			// Attempt to take preprocessed data if available
@@ -205,7 +211,8 @@ public:
 			if (Conn->TakePreprocessedTableData<RowType>(Update, Pre))
 			{
 				// If preprocessed data is available, use it to update the table
-				LastDiff = Table->Update(Pre->Inserts, Pre->Deletes);
+				PendingInserts.Append(MoveTemp(Pre->Inserts));
+				PendingDeletes.Append(MoveTemp(Pre->Deletes));
 			}
 			else
 			{
@@ -213,9 +220,19 @@ public:
 				UE_LOG(LogSpacetimeDb_Connection, Warning, TEXT("No preprocessed data for table update. Processing directly."));
 				TArray<FWithBsatn<RowType>> Inserts, Deletes;
 				UE::SpacetimeDB::ProcessTableUpdateWithBsatn<RowType>(Update, Inserts, Deletes);
-				LastDiff = Table->Update(Inserts, Deletes);
+				PendingInserts.Append(MoveTemp(Inserts));
+				PendingDeletes.Append(MoveTemp(Deletes));
 			}
 		}
+
+		//** Apply everything collected for this table in one Update, so DeriveUpdatesByPrimaryKey also pairs rows across queries */
+		virtual void ApplyPendingToCache() override
+		{
+			LastDiff = Table->Update(MoveTemp(PendingInserts), MoveTemp(PendingDeletes));
+			PendingInserts.Reset();
+			PendingDeletes.Reset();
+		}
+		// WAYFINDER_CHANGE -END
 		//** Broadcast the last stored diff to the table's delegates */
 		virtual void BroadcastDiff(UDbConnectionBase* Conn, void* Context) override
 		{
@@ -226,6 +243,10 @@ public:
 	private:
 		TableClass* Table;
 		FTableAppliedDiff<RowType> LastDiff;
+		// WAYFINDER_CHANGE -BEGIN: rows collected from every TableUpdate for this table in the current message
+		TArray<FWithBsatn<RowType>> PendingInserts;
+		TArray<FWithBsatn<RowType>> PendingDeletes;
+		// WAYFINDER_CHANGE -END
 	};
 	//** Register a table with the connection. This will allow the connection to handle updates for the table.
 	template<typename RowType, typename TableClass, typename EventContext>
@@ -283,9 +304,12 @@ protected:
 
 	/** Internal handler that processes a single server message. */
 	void ProcessServerMessage(const FServerMessageType& Message);
-	void PreProcessDatabaseUpdate(const FDatabaseUpdateType& Update);
+	// WAYFINDER_CHANGE -BEGIN: keep a message's deserialized rows with the message until it is released in order
+	using FPreprocessedTableDataList = TArray<TPair<FPreprocessedTableKey, TSharedPtr<UE::SpacetimeDB::FPreprocessedTableDataBase>>>;
+	void PreProcessDatabaseUpdate(const FDatabaseUpdateType& Update, FPreprocessedTableDataList& OutTableData);
 	/** Decompress and parse a raw message. */
-	bool PreProcessMessage(const TArray<uint8>& Message, FServerMessageType& OutMessage);
+	bool PreProcessMessage(const TArray<uint8>& Message, FServerMessageType& OutMessage, FPreprocessedTableDataList& OutTableData);
+	// WAYFINDER_CHANGE -END
 	bool DecompressPayload(uint8 Variant, const TArray<uint8>& In, TArray<uint8>& Out);
 	bool DecompressGzip(const TArray<uint8>& InData, TArray<uint8>& OutData);
 	bool DecompressBrotli(const TArray<uint8>& InData, TArray<uint8>& OutData);
@@ -300,6 +324,11 @@ protected:
 
 	/** Map of preprocessed messages keyed by their sequential id. */
 	TMap<int32, FServerMessageType> PreprocessedMessages;
+
+	// WAYFINDER_CHANGE -BEGIN: messages are parsed on parallel threads; queueing rows at parse completion let a later message's rows be taken by an earlier one
+	/** Deserialized table rows of each preprocessed message, moved to PreprocessedTableData when the message is released in order. Protected by PreprocessMutex. */
+	TMap<int32, FPreprocessedTableDataList> PreprocessedTableDataById;
+	// WAYFINDER_CHANGE -END
 
 	/** Protects PreprocessedMessages and PendingMessages ordering state. */
 	FCriticalSection PreprocessMutex;

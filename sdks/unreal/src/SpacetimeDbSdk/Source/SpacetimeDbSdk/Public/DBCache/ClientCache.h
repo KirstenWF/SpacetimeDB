@@ -143,6 +143,14 @@ public:
         // Phase 3: Finalize Deletes and Update Indices
         for (const auto& KeyValue : DeletedEntries)
         {
+            // WAYFINDER_CHANGE -BEGIN: with several queries' rows in one batch, a row dropped by one query can be re-added by another in phase 2; it is still live then
+            const FRowEntry<RowType>* Entry = Table->Entries.Find(KeyValue.Key);
+            if (Entry && Entry->RefCount > 0)
+            {
+                continue;
+            }
+            // WAYFINDER_CHANGE -END
+
             // Add to diff before removal
             Diff.Deletes.Add(KeyValue.Key, *KeyValue.Value.Value);
             Table->Entries.Remove(KeyValue.Key);
